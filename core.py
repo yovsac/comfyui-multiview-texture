@@ -18,6 +18,7 @@ Pipeline (texture_mesh):
   6. hidden texels: smoothed generated colour + smooth offset toward the projected colour
   7. island padding
 """
+import logging
 import math
 import numpy as np
 import torch
@@ -839,28 +840,60 @@ def touchup_apply(vertices_yup, faces, uvs, tex, regions, edits, log=print):
     return torch.tensor(img[idx[0], idx[1]])
 
 
-def auto_frame(images, masks, fill=0.91, size=1024):
+def _robust_box(m):
+    """Cut-out box ignoring thin protrusions (antennas, mirrors' stalks, stray pixels): rows / columns with < 3 % of the fullest one."""
+    b = m > 0.5
+    rows, cols = b.sum(1), b.sum(0)
+    if rows.max() == 0:
+        return None
+    r = np.nonzero(rows > 0.03 * rows.max())[0]; c = np.nonzero(cols > 0.03 * cols.max())[0]
+    return c.min(), r.min(), c.max() + 1, r.max() + 1
+
+
+def auto_frame(images, masks, fill=0.91, size=1024, match_height=True, mirror_missing_side=True):
     """Re-frame four photos so the object is big and centred, as the four-view rig expects.
 
-    images: four (H, W, 3) uint8 arrays, any size (the ORIGINAL photos, so no detail is lost).
+    images: four (H, W, 3) uint8 arrays (front, left, back, right), any size (the ORIGINAL photos, so no detail is lost).
     masks:  four (T, T) float arrays from a ResizeAndPadImage(T, T, black) + RemoveBackground pre-pass.
-    One zoom is shared by all four views (their relative scale is kept): the widest cut-out, in either
-    direction, fills `fill` of the frame. Each view is centred on its own cut-out box; outside the photo
-    is black. A view with no cut-out keeps its frame centre. Returns four (size, size, 3) uint8 arrays
-    and the shared crop side in mask-frame pixels (None = nothing found, plain fit-and-pad)."""
+    match_height: every view is scaled so the object has the SAME HEIGHT (a car is equally tall in all four level
+      views). Fixes views framed one by one, e.g. Two-Input Multiview output (car drawn ~30 % bigger in front/back than
+      in the side view -> mesh 32-39 % too wide, 2026-10-12). Off = one zoom shared by all four (relative scale as given).
+    mirror_missing_side: an empty side slot (no object found, e.g. the black placeholder of an unused optional input)
+      is filled with the mirrored other side.
+    The widest normalised cut-out fills `fill` of the frame; each view is centred on its own cut-out box; outside the
+    photo is black. A view with no cut-out keeps its frame centre. Returns four (size, size, 3) uint8 arrays and the
+    shared crop side in mask-frame pixels (None = nothing found, plain fit-and-pad)."""
     from PIL import Image
+    images, masks = list(images), list(masks)
     boxes = []
     for m in masks:
-        ys, xs = np.nonzero(m > 0.5)
-        boxes.append((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1) if len(xs) >= 64 else None)
+        if match_height or mirror_missing_side:
+            n = int((m > 0.5).sum())
+            boxes.append(_robust_box(m) if n >= max(64, 0.002 * m.size) else None)
+        else:   # both options off = exactly the release framing (plain cut-out box, >= 64 px)
+            ys, xs = np.nonzero(m > 0.5)
+            boxes.append((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1) if len(xs) >= 64 else None)
+    if mirror_missing_side:
+        for a, b in ((1, 3), (3, 1)):
+            if boxes[a] is None and boxes[b] is not None:
+                images[a] = np.ascontiguousarray(images[b][:, ::-1]); masks[a] = np.ascontiguousarray(masks[b][:, ::-1])
+                boxes[a] = _robust_box(masks[a])
+                logging.info("[MultiviewAutoFrame] %s side empty -> mirrored %s side", ("left", "right")[a == 3], ("left", "right")[b == 3])
     found = [b for b in boxes if b is not None]
-    span = max(max(b[2] - b[0], b[3] - b[1]) for b in found) / fill if found else None
+    if not found:
+        span, scale = None, [1.0] * 4
+    else:
+        hs = [b[3] - b[1] for b in found]; h_ref = float(np.median(hs))
+        scale = [(h_ref / (b[3] - b[1]) if (match_height and b is not None) else 1.0) for b in boxes]   # mask px -> common units
+        span = max(max(b[2] - b[0], b[3] - b[1]) * k for b, k in zip(boxes, scale) if b is not None) / fill
+        if match_height:
+            logging.info("[MultiviewAutoFrame] height match: object heights %s px -> scale %s", [None if b is None else b[3] - b[1] for b in boxes], [round(k, 3) for k in scale])
     out = []
-    for img, m, b in zip(images, masks, boxes):
+    for img, m, b, k in zip(images, masks, boxes, scale):
         T = m.shape[0]; H, W = img.shape[:2]
         s = min(T / W, T / H); nw, nh = int(W * s), int(H * s)   # ResizeAndPadImage geometry
         ox, oy = (T - nw) // 2, (T - nh) // 2; sx, sy = nw / W, nh / H
-        sp = span or T
+        sp = (span / k) if span else T                           # this view's crop side in its own mask pixels
         cx, cy = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) if b is not None else (T / 2, T / 2)
         x0, y0 = (cx - sp / 2 - ox) / sx, (cy - sp / 2 - oy) / sy
         box = (round(x0), round(y0), round(x0 + sp / sx), round(y0 + sp / sy))

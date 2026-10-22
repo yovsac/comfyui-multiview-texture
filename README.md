@@ -27,7 +27,7 @@ and `Pillow`, which ComfyUI already installs.
 
 | Node (class name) | Display name | What it does |
 |---|---|---|
-| `MultiviewAutoFrame` | Multi-View Auto Frame | Crops each photo around the car with one zoom shared by all four views, so they keep their relative scale. |
+| `MultiviewAutoFrame` | Multi-View Auto Frame | Crops each photo around the car and scales every view so the car is equally tall in all four (`match_height`, on by default), so views framed one by one don't give a squashed, too-wide car. An empty side slot is filled with the mirrored other side (`mirror_missing_side`, on by default). |
 | `MultiviewPanelUnwrap` | Multi-View Panel Unwrap (UVs) | Drop-in for the native `UnwrapMesh`: texture space only for the surface the cameras see, laid out as low-stretch panels (CPU, ~1.5-2 min per car). |
 | `MultiviewProjectTexture` | Multi-View Project Texture | Paints the four views onto the UV layout through the exact rig cameras; hidden surfaces keep the generated colour. |
 | `MeshShadingForPhotoTexture` | Mesh Shading for Photo Texture | Smoothed shading normals + optional metallic/roughness overrides. |

@@ -421,7 +421,7 @@ class Save3DReturnPath:
 class MultiviewAutoFrame:
     """Photos with backgrounds have the object small and low in the frame; Trellis then builds a boxier, blurrier
     model (S-01 on forest photos: side view 37% of the frame, width/length +10%). Crops each ORIGINAL photo around
-    its cut-out, one zoom shared by all four views so their relative scale is kept, object centred, widest view
+    its cut-out, each view scaled so the object is equally tall in all four (match_height), object centred, widest view
     filling `fill` of the frame. Masks: ResizeAndPadImage(1024, black) + RemoveBackground pre-pass per view.
     Inputs that already fill the frame pass through unchanged."""
 
@@ -430,18 +430,20 @@ class MultiviewAutoFrame:
         return {"required": {"front": ("IMAGE",), "left": ("IMAGE",), "back": ("IMAGE",), "right": ("IMAGE",),
                              "front_mask": ("MASK",), "left_mask": ("MASK",), "back_mask": ("MASK",), "right_mask": ("MASK",),
                              "fill": ("FLOAT", {"default": 0.91, "min": 0.5, "max": 1.0, "step": 0.01}),
-                             "size": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 8})}}
+                             "size": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 8})},
+                "optional": {"match_height": ("BOOLEAN", {"default": True, "tooltip": "Scale every view so the object is equally tall in all four (fixes views framed one by one, e.g. Two-Input Multiview output)."}),
+                             "mirror_missing_side": ("BOOLEAN", {"default": True, "tooltip": "An empty side slot is filled with the mirrored other side."})}}
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE")
     RETURN_NAMES = ("front", "left", "back", "right")
     FUNCTION = "run"
     CATEGORY = "3d/multiview"
 
-    def run(self, front, left, back, right, front_mask, left_mask, back_mask, right_mask, fill, size):
+    def run(self, front, left, back, right, front_mask, left_mask, back_mask, right_mask, fill, size, match_height=True, mirror_missing_side=True):
         import numpy as np
         ims = [(_view_hwc(i).cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8) for i in (front, left, back, right)]
         ms = [m[0].float().cpu().numpy() for m in (front_mask, left_mask, back_mask, right_mask)]
-        out, span = core.auto_frame(ims, ms, fill, size)
+        out, span = core.auto_frame(ims, ms, fill, size, match_height, mirror_missing_side)
         logging.info("[MultiviewAutoFrame] shared crop %s px of the %d frame -> %d", "none" if span is None else round(span), ms[0].shape[0], size)
         return tuple(torch.from_numpy(o.astype(np.float32) / 255.0)[None] for o in out)
 
