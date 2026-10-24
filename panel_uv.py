@@ -445,7 +445,8 @@ def unwrap_charts(Vw, Fs, chart, fn, depth_max=10, min_faces=12, log=print, work
     out = np.zeros((len(Fs), 3, 2)); final = np.zeros(len(Fs), np.int64); nid = 0
     st = dict(flattened=0, planar=0, carved=0, splits=0, reasons={})
     items = sorted([(np.nonzero(chart == c)[0], 0, False, False) for c in np.unique(chart)], key=lambda t: -len(t[0]))
-    workers = workers or max(1, (os.cpu_count() or 2) - 2)
+    # at most 16: Windows' OpenBLAS corrupts the heap past 24 concurrent callers (96-thread servers crashed)
+    workers = workers or max(1, min(16, (os.cpu_count() or 2) - 2))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         running = {ex.submit(_process, it, Vw, Fs, fn, depth_max, min_faces) for it in items if len(it[0])}
         while running:
