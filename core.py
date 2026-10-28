@@ -866,7 +866,11 @@ def auto_frame(images, masks, fill=0.91, size=1024, match_height=True, mirror_mi
     from PIL import Image
     images, masks = list(images), list(masks)
     boxes = []
-    for m in masks:
+    for im, m in zip(images, masks):
+        # An unused slot is not black: ComfyUI loads the dim "Drop Image here" placeholder, whose grey icon the
+        # background remover keeps as an object. No real photo is that dark (99.5th pct luminance ~35 vs >150).
+        if mirror_missing_side and np.percentile(np.asarray(im, np.float32).mean(axis=2), 99.5) < 80:
+            boxes.append(None); continue
         if match_height or mirror_missing_side:
             n = int((m > 0.5).sum())
             boxes.append(_robust_box(m) if n >= max(64, 0.002 * m.size) else None)
