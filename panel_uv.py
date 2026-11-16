@@ -11,7 +11,7 @@
 4. pack with xatlas (MIT) as a UV mesh, so relative panel sizes are kept (underside at reduced density).
 """
 import time
-import numpy as np, scipy.sparse as sp, scipy.sparse.linalg as sla, torch
+import numpy as np, scipy.sparse as sp, scipy.sparse.linalg as sla
 from scipy.sparse.csgraph import connected_components
 
 TAU = 1.25          # PartUV: accepted panel = mean area distortion <= 1.25
@@ -27,6 +27,7 @@ UNDERSIDE = 3
 # ---------------------------------------------------------------------------------------------- shell + panels
 def visible_shell(Vw, Fw, fov=20.0, res=1536, rings=4):
     """face mask: seen by any of CAMS (rig cameras, same framing as the projection) plus `rings` of neighbours"""
+    import torch
     from . import core
     dev = core._dev()
     P = core.yup_to_rig(torch.tensor(Vw, dtype=torch.float32, device=dev)); Fd = torch.tensor(Fw, dtype=torch.long, device=dev)
@@ -434,40 +435,168 @@ def _process(item, Vw, Fs, fn, depth_max, min_faces):
     return ("push", [(idx[gsplit], depth + 1, False, False), (idx[~gsplit], depth + 1, False, False)], "split:" + why.split()[0])
 
 
-def unwrap_charts(Vw, Fs, chart, fn, depth_max=10, min_faces=12, log=print, workers=None):
+def _proc_count():
+    """worker processes for unwrap_charts: MVTEX_UNWRAP_PROCS, else half the logical CPUs (about the physical
+    cores), at most 8. 1 = everything in this process."""
+    import os
+    v = os.environ.get("MVTEX_UNWRAP_PROCS", "").strip()
+    if v:
+        return max(1, min(32, int(v)))
+    return max(1, min(8, (os.cpu_count() or 2) // 2))
+
+
+class _Pool:
+    """plain worker processes running uv_worker.py, fed over pipes (no multiprocessing: under ComfyUI that would
+    re-run ComfyUI's main.py in every child on Windows)"""
+
+    def __init__(self, n, Vw, Fs, fn, depth_max, min_faces):
+        import os, pickle, queue, struct, subprocess, sys, threading
+        self.pickle, self.struct = pickle, struct
+        here = os.path.dirname(os.path.abspath(__file__))
+        env = dict(os.environ, OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", PYTHONUTF8="1")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self.q = queue.Queue(); self.procs = []
+        init = (os.path.join(here, "panel_uv.py"), Vw, Fs, fn, depth_max, min_faces)
+        for _ in range(n):
+            p = subprocess.Popen([sys.executable, "-s", "-u", os.path.join(here, "uv_worker.py")], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, env=env, creationflags=flags)
+            self.procs.append(p); self._send(p, init)
+        for p in self.procs:
+            msg = self._recv(p)
+            if not msg or msg[0] != "ready":
+                raise RuntimeError("unwrap worker did not start")
+            threading.Thread(target=self._reader, args=(p,), daemon=True).start()
+
+    def _send(self, p, obj):
+        b = self.pickle.dumps(obj, protocol=self.pickle.HIGHEST_PROTOCOL)
+        p.stdin.write(self.struct.pack("<Q", len(b)) + b); p.stdin.flush()
+
+    def _recv(self, p):
+        h = p.stdout.read(8)
+        if len(h) < 8: return None
+        return self.pickle.loads(p.stdout.read(self.struct.unpack("<Q", h)[0]))
+
+    def _reader(self, p):
+        while True:
+            msg = self._recv(p)
+            self.q.put((p, msg))
+            if msg is None: return
+
+    def map(self, kind, payloads, local):
+        """run payloads on the workers (one each at a time), results in order; a failed one runs here via local()"""
+        res = [None] * len(payloads); todo = list(range(len(payloads))); busy = {}; idle = list(self.procs)
+        while todo or busy:
+            while todo and idle:
+                p = idle.pop(); i = todo.pop(0); busy[p] = i; self._send(p, (i, kind, payloads[i]))
+            if not busy:
+                i = todo.pop(0); res[i] = local(*payloads[i]); continue
+            p, msg = self.q.get()
+            i = busy.pop(p)
+            if msg is None:
+                self.procs.remove(p); res[i] = local(*payloads[i]); continue
+            res[i] = msg[2] if msg[1] == "ok" else local(*payloads[i])
+            idle.append(p)
+        return res
+
+    def close(self):
+        for p in self.procs:
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
+        for p in self.procs:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+
+
+def _start_pool(n, Vw, Fs, fn, depth_max=10, min_faces=12, log=print):
+    if n <= 1:
+        return None
+    try:
+        return _Pool(n, Vw.astype(np.float64), Fs, fn, depth_max, min_faces)
+    except Exception as e:
+        log(f"unwrap workers unavailable ({e!r}), running in one process")
+        return None
+
+
+def unwrap_charts(Vw, Fs, chart, fn, depth_max=10, min_faces=12, log=print, workers=None, pool=None):
     """Vw welded verts, Fs shell faces, chart id per face, fn smoothed face normals.
     Per piece: cut non-manifold seams -> carve small tunnels -> flatten (Tutte -> SLIM) -> accept, else split.
-    Pieces are independent and run in parallel threads (numpy / SuperLU release the GIL).
-    Returns per-face-corner UV (|Fs|,3,2) in 3D units (each chart its own frame) and final chart ids."""
-    import os
-    from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
+    Pieces are independent: they run in worker processes (threads were slower than one: the pieces are thousands of
+    small numpy calls that hold the GIL). Chart ids are given in a fixed order, so the result does not depend on
+    the number of workers. Returns per-face-corner UV (|Fs|,3,2) in 3D units and final chart ids."""
+    import collections
     Vw = Vw.astype(np.float64)
-    out = np.zeros((len(Fs), 3, 2)); final = np.zeros(len(Fs), np.int64); nid = 0
+    out = np.zeros((len(Fs), 3, 2)); final = np.zeros(len(Fs), np.int64)
     st = dict(flattened=0, planar=0, carved=0, splits=0, reasons={})
     items = sorted([(np.nonzero(chart == c)[0], 0, False, False) for c in np.unique(chart)], key=lambda t: -len(t[0]))
-    # at most 16: Windows' OpenBLAS corrupts the heap past 24 concurrent callers (96-thread servers crashed)
-    workers = workers or max(1, min(16, (os.cpu_count() or 2) - 2))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        running = {ex.submit(_process, it, Vw, Fs, fn, depth_max, min_faces) for it in items if len(it[0])}
-        while running:
-            done, running = wait(running, return_when=FIRST_COMPLETED)
-            for fut in done:
-                r = fut.result()
-                if r[0] == "done":
-                    _, idx, uv, kind = r; out[idx] = uv; final[idx] = nid; nid += 1; st[kind] += 1
+    pieces = []
+
+    def handle(r):
+        if r[0] == "done":
+            _, idx, uv, kind = r; out[idx] = uv; pieces.append(idx); st[kind] += 1; return []
+        _, new, why = r
+        if why == "carved": st["carved"] += 1
+        elif why: st["splits"] += 1; k = why.split(":")[1]; st["reasons"][k] = st["reasons"].get(k, 0) + 1
+        return [it for it in new if len(it[0])]
+
+    todo = collections.deque(it for it in items if len(it[0]))
+    own = pool is None
+    if own:
+        pool = _start_pool(workers or _proc_count(), Vw, Fs, fn, depth_max, min_faces, log)
+    n = len(pool.procs) if pool is not None else 1
+    if pool is None:
+        while todo:
+            todo.extend(handle(_process(todo.popleft(), Vw, Fs, fn, depth_max, min_faces)))
+    else:
+        try:
+            busy, tid = {}, 0                                   # process -> (task id, item)
+            idle = list(pool.procs)
+            while todo or busy:
+                while todo and idle:
+                    p = idle.pop(); it = todo.popleft(); tid += 1; busy[p] = (tid, it); pool._send(p, (tid, "piece", it))
+                if not busy:                                    # every worker gone: finish here
+                    todo.extend(handle(_process(todo.popleft(), Vw, Fs, fn, depth_max, min_faces)))
+                    continue
+                p, msg = pool.q.get()
+                _, it = busy.pop(p)
+                if msg is None:                                 # worker died: do its piece here, carry on without it
+                    log("unwrap worker exited, its piece runs in this process"); pool.procs.remove(p)
+                    todo.extend(handle(_process(it, Vw, Fs, fn, depth_max, min_faces)))
+                    continue
+                if msg[1] == "ok":
+                    todo.extend(handle(msg[2]))
                 else:
-                    _, new, why = r
-                    if why == "carved": st["carved"] += 1
-                    elif why: st["splits"] += 1; k = why.split(":")[1]; st["reasons"][k] = st["reasons"].get(k, 0) + 1
-                    running |= {ex.submit(_process, it, Vw, Fs, fn, depth_max, min_faces) for it in new if len(it[0])}
-    log(f"charts: {nid} ({st['flattened']} flattened, {st['planar']} planar); {st['carved']} tunnel carvings, {st['splits']} splits {st['reasons']}")
+                    todo.extend(handle(_process(it, Vw, Fs, fn, depth_max, min_faces)))
+                idle.append(p)
+        finally:
+            if own:
+                pool.close()
+    pieces.sort(key=lambda idx: int(idx.min()))                 # fixed chart numbering
+    for k, idx in enumerate(pieces):
+        final[idx] = k
+    log(f"charts: {len(pieces)} ({st['flattened']} flattened, {st['planar']} planar); {st['carved']} tunnel carvings, "
+        f"{st['splits']} splits {st['reasons']}; {n if pool is not None else 1} process(es)")
     return out, final
 
 
-def pack(uv_corner, chart, Vw, Fs, scale_per_chart=None, resolution=4096, padding=4, brute=False, log=print):
+def _xatlas_try(U, Fi, resolution, tpu, padding, brute):
+    """one xatlas pack of the UV mesh at tpu texels per unit; the fields pack() reads (first atlas only)"""
+    import xatlas
+    at = xatlas.Atlas(); at.add_uv_mesh(U, Fi)
+    po = xatlas.PackOptions(); po.resolution = resolution; po.texels_per_unit = tpu; po.padding = padding
+    po.rotate_charts = True; po.bruteForce = brute; po.bilinear = True
+    at.generate(pack_options=po)
+    vm, idx, uvo = at[0]
+    return dict(atlas_count=at.atlas_count, chart_count=at.chart_count, width=at.width, height=at.height,
+                utilization=at.utilization, first=(vm, idx, uvo))
+
+
+def pack(uv_corner, chart, Vw, Fs, scale_per_chart=None, resolution=4096, padding=4, brute=False, log=print, pool=None):
     """scale each chart so UV area = 3D area (times scale_per_chart[c] in area), then xatlas add_uv_mesh
     (keeps relative chart sizes). Returns per-corner UV in [0,1], uniform scale on both axes."""
-    import xatlas
     uvc = uv_corner.copy()
     p = Vw[Fs]; a3 = np.linalg.norm(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1) / 2
     t = uvc; a2 = np.abs((t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1]) - (t[:, 2, 0] - t[:, 0, 0]) * (t[:, 1, 1] - t[:, 0, 1])) / 2
@@ -479,13 +608,17 @@ def pack(uv_corner, chart, Vw, Fs, scale_per_chart=None, resolution=4096, paddin
     k = np.minimum(k, 2.0 * kl)                                      # a squashed sliver must not blow up past its real size
     if scale_per_chart is not None: k = k * np.sqrt(scale_per_chart)
     ids = np.unique(chart); ext = np.zeros(chart.max() + 1)
-    for c in ids:                                                    # scale each chart about its own corner
-        m = chart == c; cc = uvc[m].reshape(-1, 2); uvc[m] = (uvc[m] - cc.min(0)) * k[c]; ext[c] = uvc[m].max()
+    # scale each chart about its own corner (vectorised: one pass over the faces sorted by chart, not one per chart)
+    o = np.argsort(chart, kind="stable"); cs = chart[o]; starts = np.r_[0, np.nonzero(cs[1:] != cs[:-1])[0] + 1]
+    lo = np.minimum.reduceat(uvc[o].min(1), starts, axis=0)            # per chart min u, min v over its corners
+    mins = np.zeros((chart.max() + 1, 2)); mins[cs[starts]] = lo
+    uvc = (uvc - mins[chart][:, None, :]) * k[chart][:, None, None]
+    ext[cs[starts]] = np.maximum.reduceat(uvc[o].reshape(len(o), -1).max(1), starts)
     uvc = np.nan_to_num(uvc); assert np.isfinite(ext[ids]).all()
     # lay the charts out on a grid first: xatlas treats charts that overlap in its INPUT as one chart
     cell = ext.max() * 1.05; cols = int(np.ceil(np.sqrt(len(ids))))
-    for j, c in enumerate(ids):
-        m = chart == c; uvc[m] += np.array([(j % cols) * cell, (j // cols) * cell])
+    j = np.zeros(chart.max() + 1, np.int64); j[ids] = np.arange(len(ids))
+    uvc += np.stack([(j % cols) * cell, (j // cols) * cell], 1)[chart][:, None, :]
     # one vertex per (chart, corner position) so islands are separate in the UV mesh
     key = np.c_[np.repeat(chart, 3), np.round(uvc.reshape(-1, 2) * 1e7).astype(np.int64)]
     u, inv = np.unique(key, axis=0, return_inverse=True); inv = inv.ravel()
@@ -494,20 +627,27 @@ def pack(uv_corner, chart, Vw, Fs, scale_per_chart=None, resolution=4096, paddin
     Fi = inv.reshape(-1, 3).astype(np.uint32)
     tu = U[Fi]; S = np.abs((tu[:, 1, 0]-tu[:, 0, 0])*(tu[:, 2, 1]-tu[:, 0, 1])-(tu[:, 2, 0]-tu[:, 0, 0])*(tu[:, 1, 1]-tu[:, 0, 1])).sum() / 2
     tpu = float(np.sqrt(0.75 * resolution ** 2 / S))                  # texels per UV unit for ~75% fill of one sheet
-    for _ in range(30):                                              # shrink until everything fits one sheet
-        at = xatlas.Atlas(); at.add_uv_mesh(U, Fi)
-        po = xatlas.PackOptions(); po.resolution = resolution; po.texels_per_unit = tpu; po.padding = padding
-        po.rotate_charts = True; po.bruteForce = brute; po.bilinear = True
-        at.generate(pack_options=po)
-        if at.atlas_count == 1: break
-        tpu *= 0.97
-    log(f'xatlas charts {at.chart_count} (input charts {len(ids)}), atlases {at.atlas_count}, {at.width}x{at.height}, texels/unit {tpu:.0f}')
-    vm, idx, uvo = at[0]
-    tex = uvo * np.array([at.width, at.height], np.float32) / resolution       # true texels of a resolution^2 sheet
+    # shrink until everything fits one sheet: tries tpu, tpu*0.97, ... (30 at most); the first that fits wins.
+    # With worker processes the tries run side by side, one batch per round, same result as one after another.
+    tries = []
+    for _ in range(30):
+        tries.append(tpu); tpu *= 0.97
+    width = len(pool.procs) if pool is not None and pool.procs else 1
+    at = None
+    for b in range(0, 30, width):
+        batch = [(U, Fi, resolution, t, padding, brute) for t in tries[b:b + width]]
+        res = pool.map("xatlas", batch, _xatlas_try) if width > 1 else [_xatlas_try(*batch[0])]
+        fit = [i for i, r in enumerate(res) if r["atlas_count"] == 1]
+        if fit:
+            at = res[fit[0]]; tpu = tries[b + fit[0]]; break
+        at = res[-1]; tpu = tries[b + len(res) - 1] * 0.97
+    log(f'xatlas charts {at["chart_count"]} (input charts {len(ids)}), atlases {at["atlas_count"]}, {at["width"]}x{at["height"]}, texels/unit {tpu:.0f}')
+    vm, idx, uvo = at["first"]
+    tex = uvo * np.array([at["width"], at["height"]], np.float32) / resolution       # true texels of a resolution^2 sheet
     out = tex[idx].reshape(-1, 3, 2).copy()
     # xatlas skips triangles too small to rasterise; vertices used only by those keep their raw INPUT
     # coordinates (unplaced). Snap such triangles onto a placed corner (they cover no texel anyway).
-    placed = ~np.all(np.isclose(uvo * np.array([at.width, at.height], np.float32), U[vm], rtol=0, atol=1e-4), axis=1)
+    placed = ~np.all(np.isclose(uvo * np.array([at["width"], at["height"]], np.float32), U[vm], rtol=0, atol=1e-4), axis=1)
     ok = (vm[idx] == Fi) & placed[idx]
     bad = ~ok.all(1)
     if bad.any():
@@ -518,7 +658,7 @@ def pack(uv_corner, chart, Vw, Fs, scale_per_chart=None, resolution=4096, paddin
         pt = np.where(anyok[:, None], out[np.arange(len(out)), first], fallback[chart])
         out[bad] = pt[bad][:, None, :]
     log(f'xatlas: {int(bad.sum())} sub-texel triangles with unplaced corners snapped onto a placed corner')
-    return out, (at.width, at.height, at.utilization)
+    return out, (at["width"], at["height"], at["utilization"])
 
 
 # ---------------------------------------------------------------------------------------------- entry point
@@ -534,10 +674,15 @@ def panel_unwrap(vertices, faces, resolution=4096, padding=4, underside=0.25, fo
     Adj = face_adjacency(Fs); n = smoothed_normals(Vw, Fs, Adj)
     chart, lab = panels(Fs, n, Adj)
     log(f"visible shell {len(shell)} of {len(F)} faces, {chart.max() + 1} panels ({time.time() - t0:.0f}s)")
-    uvc, final = unwrap_charts(Vw, Fs, chart, n, log=log)
-    under = np.bincount(final, weights=(lab == UNDERSIDE).astype(float)) / np.maximum(np.bincount(final), 1) > 0.5
-    uv, (w, h, util) = pack(uvc, final, Vw, Fs, scale_per_chart=np.where(under, underside, 1.0),
-                            resolution=int(resolution), padding=int(padding), log=log)
+    pool = _start_pool(_proc_count(), Vw, Fs, n, log=log)
+    try:
+        uvc, final = unwrap_charts(Vw, Fs, chart, n, log=log, pool=pool)
+        under = np.bincount(final, weights=(lab == UNDERSIDE).astype(float)) / np.maximum(np.bincount(final), 1) > 0.5
+        uv, (w, h, util) = pack(uvc, final, Vw, Fs, scale_per_chart=np.where(under, underside, 1.0),
+                                resolution=int(resolution), padding=int(padding), log=log, pool=pool)
+    finally:
+        if pool is not None:
+            pool.close()
     # hidden faces park on one texel in the free corner; panels keep [0, 0.99]
     corner = np.full((len(F), 3, 2), 0.995, np.float32); corner[shell] = uv * 0.99
     key = np.c_[F.ravel(), np.round(corner.reshape(-1, 2) * (1 << 22)).astype(np.int64)]

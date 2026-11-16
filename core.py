@@ -27,6 +27,8 @@ from scipy import sparse, ndimage
 from scipy.sparse.linalg import splu
 
 VIEW_AZ = {"front": 0.0, "left": 90.0, "back": 180.0, "right": 270.0}
+TOP_EL = 90.0          # the top view: camera straight above, image up = the object's rear, front at the bottom
+TOP_ROT = {"down": 0, "up": 2, "left": 1, "right": 3}   # np.rot90 turns (counter-clockwise) that bring the front to the bottom
 VIEW_PAD = 1.1
 
 DEFAULTS = dict(
@@ -89,7 +91,9 @@ class Cam:
         back = torch.tensor([math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e)], device=dev)
         self.pos = back * self.dist
         self.fwd = -back
-        self.right = F.normalize(torch.linalg.cross(self.fwd, torch.tensor([0.0, 0, 1], device=dev)), dim=0)
+        # right axis from the azimuth, as in Pixal3D's _orbit_camera_to_world: equal to normalize(fwd x z) below 90 deg
+        # elevation, and still defined for the top view (el = 90), where fwd x z vanishes
+        self.right = torch.tensor([math.cos(a), math.sin(a), 0.0], device=dev)
         self.up = torch.linalg.cross(self.right, self.fwd)
         self.W = self.H = res
         self.f = (res / 2) / math.tan(fov / 2)
@@ -850,7 +854,8 @@ def _robust_box(m):
     return c.min(), r.min(), c.max() + 1, r.max() + 1
 
 
-def auto_frame(images, masks, fill=0.91, size=1024, match_height=True, mirror_missing_side=True):
+def auto_frame(images, masks, fill=0.91, size=1024, match_height=True, mirror_missing_side=True, top=None, top_mask=None,
+               top_front="down"):
     """Re-frame four photos so the object is big and centred, as the four-view rig expects.
 
     images: four (H, W, 3) uint8 arrays (front, left, back, right), any size (the ORIGINAL photos, so no detail is lost).
@@ -860,6 +865,9 @@ def auto_frame(images, masks, fill=0.91, size=1024, match_height=True, mirror_mi
       in the side view -> mesh 32-39 % too wide, 2026-10-12). Off = one zoom shared by all four (relative scale as given).
     mirror_missing_side: an empty side slot (no object found, e.g. the black placeholder of an unused optional input)
       is filled with the mirrored other side.
+    top / top_mask: optional photo from straight above (its mask from the same pre-pass), turned so the object's front
+      (top_front: where it points in the photo) is at the bottom, as the rig's top camera sees it. Scaled so the object
+      is as wide as in the front view (or, without a front, as long as in the side view); returned as a fifth view.
     The widest normalised cut-out fills `fill` of the frame; each view is centred on its own cut-out box; outside the
     photo is black. A view with no cut-out keeps its frame centre. Returns four (size, size, 3) uint8 arrays and the
     shared crop side in mask-frame pixels (None = nothing found, plain fit-and-pad)."""
@@ -883,12 +891,32 @@ def auto_frame(images, masks, fill=0.91, size=1024, match_height=True, mirror_mi
                 images[a] = np.ascontiguousarray(images[b][:, ::-1]); masks[a] = np.ascontiguousarray(masks[b][:, ::-1])
                 boxes[a] = _robust_box(masks[a])
                 logging.info("[MultiviewAutoFrame] %s side empty -> mirrored %s side", ("left", "right")[a == 3], ("left", "right")[b == 3])
-    found = [b for b in boxes if b is not None]
+    if top is not None:
+        k_rot = TOP_ROT[top_front]
+        images.append(np.ascontiguousarray(np.rot90(top, k_rot))); masks.append(np.ascontiguousarray(np.rot90(top_mask, k_rot)))
+        m = masks[4]
+        boxes.append(_robust_box(m) if int((m > 0.5).sum()) >= max(64, 0.002 * m.size) else None)
+    found = [b for b in boxes[:4] if b is not None]
     if not found:
-        span, scale = None, [1.0] * 4
+        span, scale = None, [1.0] * len(boxes)
     else:
         hs = [b[3] - b[1] for b in found]; h_ref = float(np.median(hs))
-        scale = [(h_ref / (b[3] - b[1]) if (match_height and b is not None) else 1.0) for b in boxes]   # mask px -> common units
+        scale = [(h_ref / (b[3] - b[1]) if (match_height and b is not None) else 1.0) for b in boxes[:4]]   # mask px -> common units
+        if top is not None:
+            bt, k_t = boxes[4], 1.0
+            if bt is not None:
+                ks = []
+                if boxes[0] is not None:                          # its width = the front view's width
+                    ks.append((boxes[0][2] - boxes[0][0]) * scale[0] / (bt[2] - bt[0]))
+                side = next((i for i in (1, 3) if boxes[i] is not None), None)
+                if side is not None:                              # its length = the side view's width
+                    ks.append((boxes[side][2] - boxes[side][0]) * scale[side] / (bt[3] - bt[1]))
+                if ks:                                            # both: meet in the middle (photos never agree exactly)
+                    k_t = float(np.exp(np.mean(np.log(ks))))
+                    logging.info("[MultiviewAutoFrame] top view scale from front width / side length: %s", [round(k, 3) for k in ks])
+            scale.append(k_t)
+            logging.info("[MultiviewAutoFrame] top view: front points %s, object box %s px -> scale %.3f", top_front,
+                         None if bt is None else (bt[2] - bt[0], bt[3] - bt[1]), k_t)
         span = max(max(b[2] - b[0], b[3] - b[1]) * k for b, k in zip(boxes, scale) if b is not None) / fill
         if match_height:
             logging.info("[MultiviewAutoFrame] height match: object heights %s px -> scale %s", [None if b is None else b[3] - b[1] for b in boxes], [round(k, 3) for k in scale])

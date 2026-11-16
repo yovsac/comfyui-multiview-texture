@@ -27,9 +27,10 @@ and `Pillow`, which ComfyUI already installs.
 
 | Node (class name) | Display name | What it does |
 |---|---|---|
-| `MultiviewAutoFrame` | Multi-View Auto Frame | Crops each photo around the car and scales every view so the car is equally tall in all four (`match_height`, on by default), so views framed one by one don't give a squashed, too-wide car. An empty side slot is filled with the mirrored other side (`mirror_missing_side`, on by default). |
-| `MultiviewPanelUnwrap` | Multi-View Panel Unwrap (UVs) | Drop-in for the native `UnwrapMesh`: texture space only for the surface the cameras see, laid out as low-stretch panels (CPU, ~1.5-2 min per car). |
-| `MultiviewProjectTexture` | Multi-View Project Texture | Paints the four views onto the UV layout through the exact rig cameras; hidden surfaces keep the generated colour. |
+| `MultiviewAutoFrame` | Multi-View Auto Frame | Crops each photo around the car and scales every view so the car is equally tall in all four (`match_height`, on by default), so views framed one by one don't give a squashed, too-wide car. An empty side slot is filled with the mirrored other side (`mirror_missing_side`, on by default). Optional `top` photo (+ `top_mask`, `top_front_points`): turned so the car's front is at the bottom and scaled so the car is as wide as in the front view; returned as a fifth view. |
+| `MultiviewPanelUnwrap` | Multi-View Panel Unwrap (UVs) | Drop-in for the native `UnwrapMesh`: texture space only for the surface the cameras see, laid out as low-stretch panels (CPU, in worker processes: ~15-30 s per car). Process count: half the logical CPUs, at most 8; set `MVTEX_UNWRAP_PROCS` to override (1 = in ComfyUI's process). |
+| `MultiviewProjectTexture` | Multi-View Project Texture | Paints the four views (and the optional `top` view) onto the UV layout through the exact rig cameras; hidden surfaces keep the generated colour. |
+| `MultiviewPixal3DConditioning` | Pixal3D Multi-View Conditioning (with top view) | The native `Pixal3DMultiViewConditioning` (same encoder and orbit cameras) plus an optional `top` view: a camera straight above at the front view's azimuth. |
 | `MeshShadingForPhotoTexture` | Mesh Shading for Photo Texture | Smoothed shading normals + optional metallic/roughness overrides. |
 | `MultiviewCornerPlan` | Multi-View Corner Fix (plan) | Finds lamps split across a corner and outputs crops to redraw (0 crops = nothing to fix). |
 | `MultiviewCornerApply` | Multi-View Corner Fix (apply) | Pastes the redrawn crops back. Its edit input is lazy: with no crop the edit model is never loaded. |

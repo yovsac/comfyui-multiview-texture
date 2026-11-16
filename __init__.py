@@ -73,8 +73,9 @@ class MultiviewProjectTexture:
             },
             "optional": {
                 "front": ("IMAGE",), "left": ("IMAGE",), "back": ("IMAGE",), "right": ("IMAGE",),
+                "top": ("IMAGE", {"tooltip": "View from straight above, front of the object at the bottom (MultiviewAutoFrame top)."}),
                 "glass_front": ("MASK", {"tooltip": "Glass in the front view (e.g. SAM3_Detect 'window:8'). Glass becomes one dark tint."}),
-                "glass_left": ("MASK",), "glass_back": ("MASK",), "glass_right": ("MASK",),
+                "glass_left": ("MASK",), "glass_back": ("MASK",), "glass_right": ("MASK",), "glass_top": ("MASK",),
                 "metallic": ("IMAGE", {"tooltip": "Metallic map from BakeTextureFromVoxel; glass is set to 0."}),
                 "roughness": ("IMAGE", {"tooltip": "Roughness map from BakeTextureFromVoxel; glass is set to glass_roughness."}),
                 "glass_roughness": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -87,17 +88,20 @@ class MultiviewProjectTexture:
     FUNCTION = "run"
     CATEGORY = "3d/texturing"
 
-    def run(self, mesh, base_color, fov, mode, front=None, left=None, back=None, right=None,
-            glass_front=None, glass_left=None, glass_back=None, glass_right=None,
+    def run(self, mesh, base_color, fov, mode, front=None, left=None, back=None, right=None, top=None,
+            glass_front=None, glass_left=None, glass_back=None, glass_right=None, glass_top=None,
             metallic=None, roughness=None, glass_roughness=0.3):
-        views_in = {"front": front, "left": left, "back": back, "right": right}
+        views_in = {"front": front, "left": left, "back": back, "right": right, "top": top}
         names = [n for n in core.VIEW_AZ if views_in[n] is not None]
         if not names:
-            raise ValueError("MultiviewProjectTexture needs at least one view")
+            raise ValueError("MultiviewProjectTexture needs at least one side view (front, left, back or right)")
         first = core.VIEW_AZ[names[0]]                     # the conditioning poses the mesh to its first view
         views = [(_view_hwc(views_in[n]), core.VIEW_AZ[n] - first, 0.0) for n in names]
+        if top is not None:                                # top camera: azimuth of the front, straight above
+            names.append("top")
+            views.append((_view_hwc(top), core.VIEW_AZ["front"] - first, core.TOP_EL))
         v, f, uv = _mesh_arrays(mesh)
-        glass_in = {"front": glass_front, "left": glass_left, "back": glass_back, "right": glass_right}
+        glass_in = {"front": glass_front, "left": glass_left, "back": glass_back, "right": glass_right, "top": glass_top}
         glass = None
         if any(glass_in[n] is not None for n in names):
             glass = [glass_in[n][0].float() if glass_in[n] is not None else None for n in names]
@@ -275,8 +279,11 @@ class MultiviewCornerPlan:
             glass_front, glass_left, glass_back, glass_right, lamp_front, lamp_left, lamp_back, lamp_right):
         st = {"S": None, "projected": projected, "glass": glass, "error": None}
         try:
-            if list(view_weights["names"]) != corner.NAMES:
-                raise ValueError(f"needs the four views front/left/back/right, got {view_weights['names']}")
+            vn = list(view_weights["names"])
+            if [n for n in vn if n != "top"] != corner.NAMES:
+                raise ValueError(f"needs the four views front/left/back/right, got {vn}")
+            if "top" in vn:                       # the corner fix works between side views: leave the top view's weights out
+                view_weights = {"names": corner.NAMES, "w": view_weights["w"][[vn.index(n) for n in corner.NAMES]]}
             v, f, uv = _mesh_arrays(mesh)
             rel8 = corner.to8(projected[0])
             sc = corner.Scene(v, f, uv, corner.to8(base_color[0]), [corner.to8(_view_hwc(x)) for x in (front, left, back, right)],
@@ -432,20 +439,79 @@ class MultiviewAutoFrame:
                              "fill": ("FLOAT", {"default": 0.91, "min": 0.5, "max": 1.0, "step": 0.01}),
                              "size": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 8})},
                 "optional": {"match_height": ("BOOLEAN", {"default": True, "tooltip": "Scale every view so the object is equally tall in all four (fixes views framed one by one, e.g. Two-Input Multiview output)."}),
-                             "mirror_missing_side": ("BOOLEAN", {"default": True, "tooltip": "An empty side slot is filled with the mirrored other side."})}}
+                             "mirror_missing_side": ("BOOLEAN", {"default": True, "tooltip": "An empty side slot is filled with the mirrored other side."}),
+                             "top": ("IMAGE", {"tooltip": "Optional photo from straight above. Scaled so the object is as wide as in the front view."}),
+                             "top_mask": ("MASK", {"tooltip": "Cut-out of the top photo (same ResizeAndPadImage + RemoveBackground pre-pass)."}),
+                             "top_front_points": (list(core.TOP_ROT), {"default": "up", "tooltip": "Where the object's front points in the top photo; it is turned so the front is at the bottom, as the rig's top camera sees it."})}}
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE")
-    RETURN_NAMES = ("front", "left", "back", "right")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("front", "left", "back", "right", "top")
     FUNCTION = "run"
     CATEGORY = "3d/multiview"
 
-    def run(self, front, left, back, right, front_mask, left_mask, back_mask, right_mask, fill, size, match_height=True, mirror_missing_side=True):
+    def run(self, front, left, back, right, front_mask, left_mask, back_mask, right_mask, fill, size, match_height=True, mirror_missing_side=True,
+            top=None, top_mask=None, top_front_points="up"):
         import numpy as np
-        ims = [(_view_hwc(i).cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8) for i in (front, left, back, right)]
+        to8 = lambda i: (_view_hwc(i).cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)
+        ims = [to8(i) for i in (front, left, back, right)]
         ms = [m[0].float().cpu().numpy() for m in (front_mask, left_mask, back_mask, right_mask)]
-        out, span = core.auto_frame(ims, ms, fill, size, match_height, mirror_missing_side)
+        use_top = top is not None and top_mask is not None
+        out, span = core.auto_frame(ims, ms, fill, size, match_height, mirror_missing_side,
+                                    top=to8(top) if use_top else None, top_mask=top_mask[0].float().cpu().numpy() if use_top else None,
+                                    top_front=top_front_points)
+        if not use_top:
+            out.append(np.zeros((size, size, 3), np.uint8))
         logging.info("[MultiviewAutoFrame] shared crop %s px of the %d frame -> %d", "none" if span is None else round(span), ms[0].shape[0], size)
         return tuple(torch.from_numpy(o.astype(np.float32) / 255.0)[None] for o in out)
+
+
+class MultiviewPixal3DConditioning:
+    """Pixal3DMultiViewConditioning (the native four-view orbit rig) plus an optional top view: a camera straight above,
+    image up = the object's rear. Same encoder and cameras as the native node; the top camera is elevation 90 at the
+    front view's azimuth (_orbit_camera_to_world)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        views = {n: ("IMAGE", {"tooltip": f"Square {n} view framed like the rig (MultiviewAutoFrame)."}) for n in core.VIEW_AZ}
+        return {"required": {"clip_vision_model": ("CLIP_VISION",),
+                             "fov": ("FLOAT", {"default": 20.0, "min": 1.0, "max": 170.0, "step": 0.01})},
+                "optional": dict(views, top=("IMAGE", {"tooltip": "View from straight above, front at the bottom (MultiviewAutoFrame top)."}))}
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "run"
+    CATEGORY = "3d/multiview"
+
+    def run(self, clip_vision_model, fov, front=None, left=None, back=None, right=None, top=None):
+        import math
+        import comfy.utils
+        from comfy_extras import nodes_trellis2 as t2
+        given = {"front": front, "left": left, "back": back, "right": right}
+        names = [n for n in core.VIEW_AZ if given[n] is not None]
+        if not names:
+            raise ValueError("needs at least one side view (front, left, back or right)")
+        first = core.VIEW_AZ[names[0]]
+        az = [core.VIEW_AZ[n] - first for n in names]
+        el = [0.0] * len(names)
+        imgs = [given[n] for n in names]
+        if top is not None:
+            names.append("top"); az.append(core.VIEW_AZ["front"] - first); el.append(core.TOP_EL); imgs.append(top)
+        B = imgs[0].shape[0]
+        items = []
+        for b in range(B):
+            for im in imgs:
+                v = im[b % im.shape[0]][None]
+                if v.shape[-1] == 4:
+                    v = v[..., :3] * v[..., 3:4]
+                if v.shape[1:3] != (1024, 1024):
+                    v = comfy.utils.common_upscale(v.movedim(-1, 1), 1024, 1024, "lanczos", "disabled").movedim(1, -1)
+                items.append(v)
+        f = math.radians(fov)
+        c2w = t2._orbit_camera_to_world(az, el, t2._VIEW_PAD * 0.5 / math.tan(f / 2.0))
+        logging.info("[MultiviewPixal3DConditioning] views %s", names)
+        out = t2._build_pixal3d_conditioning(clip_vision_model, torch.cat(items, dim=0), c2w.repeat(B, 1, 1),
+                                             torch.full((B * len(names),), f), torch.ones(B), num_views=len(names))
+        return tuple(out.args)
 
 
 NODE_CLASS_MAPPINGS = {"MultiviewProjectTexture": MultiviewProjectTexture,
@@ -454,14 +520,16 @@ NODE_CLASS_MAPPINGS = {"MultiviewProjectTexture": MultiviewProjectTexture,
                        "MultiviewTouchUpApply": MultiviewTouchUpApply,
                        "MultiviewPanelUnwrap": MultiviewPanelUnwrap,
                        "Save3DReturnPath": Save3DReturnPath,
-                       "MultiviewAutoFrame": MultiviewAutoFrame}
+                       "MultiviewAutoFrame": MultiviewAutoFrame,
+                       "MultiviewPixal3DConditioning": MultiviewPixal3DConditioning}
 NODE_DISPLAY_NAME_MAPPINGS = {"MultiviewProjectTexture": "Multi-View Project Texture",
                               "MeshShadingForPhotoTexture": "Mesh Shading for Photo Texture",
                               "MultiviewTouchUpPrepare": "Multi-View Touch-Up (prepare)",
                               "MultiviewTouchUpApply": "Multi-View Touch-Up (apply)",
                               "MultiviewPanelUnwrap": "Multi-View Panel Unwrap (UVs)",
                               "Save3DReturnPath": "Save 3D (returns path)",
-                              "MultiviewAutoFrame": "Multi-View Auto Frame"}
+                              "MultiviewAutoFrame": "Multi-View Auto Frame",
+                              "MultiviewPixal3DConditioning": "Pixal3D Multi-View Conditioning (with top view)"}
 if corner is not None:
     NODE_CLASS_MAPPINGS.update(MultiviewCornerPlan=MultiviewCornerPlan, MultiviewCornerApply=MultiviewCornerApply)
     NODE_DISPLAY_NAME_MAPPINGS.update(MultiviewCornerPlan="Multi-View Corner Fix (plan)", MultiviewCornerApply="Multi-View Corner Fix (apply)")
